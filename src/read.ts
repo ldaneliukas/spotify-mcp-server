@@ -1,7 +1,7 @@
 import type { MaxInt } from '@spotify/web-api-ts-sdk';
 import { z } from 'zod';
 import type { SpotifyHandlerExtra, SpotifyTrack, tool } from './types.js';
-import { formatDuration, handleSpotifyRequest } from './utils.js';
+import { formatDuration, getAccessToken, handleSpotifyRequest } from './utils.js';
 
 function isTrack(item: any): item is SpotifyTrack {
   return (
@@ -528,6 +528,108 @@ const getQueue: tool<{
   },
 };
 
+const getTopArtists: tool<{
+  limit: z.ZodOptional<z.ZodNumber>;
+  timeRange: z.ZodOptional<z.ZodEnum<['short_term', 'medium_term', 'long_term']>>;
+}> = {
+  name: 'getTopArtists',
+  description: 'Get your top artists on Spotify based on listening history',
+  schema: {
+    limit: z
+      .number()
+      .min(1)
+      .max(50)
+      .optional()
+      .describe('Maximum number of artists to return (1-50, default: 20)'),
+    timeRange: z
+      .enum(['short_term', 'medium_term', 'long_term'])
+      .optional()
+      .describe(
+        'Time range for top artists: short_term (last 4 weeks), medium_term (last 6 months), or long_term (several years, default)',
+      ),
+  },
+  handler: async (args, _extra: SpotifyHandlerExtra) => {
+    const { limit = 20, timeRange = 'long_term' } = args;
+
+    try {
+      // Get access token and make direct API call
+      const accessToken = await getAccessToken();
+      const params = new URLSearchParams({
+        limit: limit.toString(),
+        time_range: timeRange,
+      });
+
+      const response = await fetch(
+        `https://api.spotify.com/v1/me/top/artists?${params.toString()}`,
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        },
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Failed to fetch top artists: ${response.status} ${errorText}`,
+        );
+      }
+
+      const topArtists = await response.json();
+
+      if (!topArtists.items || topArtists.items.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `You don't have any top artists data for the ${timeRange} time range. This might be due to insufficient listening history.`,
+            },
+          ],
+        };
+      }
+
+      const formattedArtists = topArtists.items
+        .map((artist: any, i: number) => {
+          const genres = artist.genres?.length > 0
+            ? ` (${artist.genres.slice(0, 3).join(', ')})`
+            : '';
+          const followers = artist.followers?.total
+            ? ` - ${artist.followers.total.toLocaleString()} followers`
+            : '';
+          return `${i + 1}. ${artist.name}${genres}${followers} - ID: ${artist.id}`;
+        })
+        .join('\n');
+
+      const timeRangeLabel =
+        timeRange === 'short_term'
+          ? 'Last 4 weeks'
+          : timeRange === 'medium_term'
+            ? 'Last 6 months'
+            : 'All time';
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `# Your Top Artists (${timeRangeLabel})\n\n${formattedArtists}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error fetching top artists: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          },
+        ],
+      };
+    }
+  },
+};
+
 export const readTools = [
   searchSpotify,
   getNowPlaying,
@@ -536,4 +638,5 @@ export const readTools = [
   getRecentlyPlayed,
   getUsersSavedTracks,
   getQueue,
+  getTopArtists,
 ];

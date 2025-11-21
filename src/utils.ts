@@ -2,12 +2,16 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { URL, fileURLToPath } from 'node:url';
 import { SpotifyApi } from '@spotify/web-api-ts-sdk';
 import open from 'open';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = path.join(__dirname, '../spotify-config.json');
+
+// Request-scoped storage for refresh token
+const refreshTokenStorage = new AsyncLocalStorage<string>();
 
 export interface SpotifyConfig {
   clientId: string;
@@ -90,6 +94,110 @@ function base64Encode(str: string): string {
   return Buffer.from(str).toString('base64');
 }
 
+/**
+ * Extracts refresh token from HTTP request headers.
+ * Looks for the "Token" header.
+ */
+export function extractRefreshTokenFromHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): string | null {
+  // Check Token header (case-insensitive)
+  const tokenHeader =
+    headers.token || headers.Token || headers['x-token'] || headers['X-Token'];
+  if (tokenHeader) {
+    return Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
+  }
+
+  return null;
+}
+
+/**
+ * Refreshes an access token using a refresh token.
+ */
+export async function refreshAccessToken(
+  refreshToken: string,
+  clientId: string,
+  clientSecret: string,
+): Promise<{ access_token: string; token_type: string; expires_in: number; refresh_token?: string }> {
+  const tokenUrl = 'https://accounts.spotify.com/api/token';
+  const authHeader = `Basic ${base64Encode(`${clientId}:${clientSecret}`)}`;
+
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('refresh_token', refreshToken);
+
+  const response = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params,
+  });
+
+  if (!response.ok) {
+    const errorData = await response.text();
+    throw new Error(`Failed to refresh access token: ${errorData}`);
+  }
+
+  const data = await response.json();
+  return {
+    access_token: data.access_token,
+    token_type: data.token_type || 'Bearer',
+    expires_in: data.expires_in || 3600,
+    refresh_token: data.refresh_token || refreshToken,
+  };
+}
+
+/**
+ * Creates a Spotify API instance for a specific user using their refresh token.
+ */
+export async function createSpotifyApiForUser(
+  refreshToken: string,
+): Promise<SpotifyApi> {
+  const config = loadSpotifyConfig();
+
+  // Refresh the access token
+  const tokenResponse = await refreshAccessToken(
+    refreshToken,
+    config.clientId,
+    config.clientSecret,
+  );
+
+  // Create SpotifyApi instance with the refreshed access token
+  const accessToken = {
+    access_token: tokenResponse.access_token,
+    token_type: tokenResponse.token_type,
+    expires_in: tokenResponse.expires_in,
+    refresh_token: tokenResponse.refresh_token || refreshToken,
+  };
+
+  return SpotifyApi.withAccessToken(config.clientId, accessToken);
+}
+
+/**
+ * Gets the refresh token from the current request context.
+ */
+export function getRefreshTokenFromContext(): string {
+  const refreshToken = refreshTokenStorage.getStore();
+  if (!refreshToken) {
+    throw new Error(
+      'Refresh token not found in request context. Ensure the request includes Token header.',
+    );
+  }
+  return refreshToken;
+}
+
+/**
+ * Runs a function within a request context that has access to the refresh token.
+ */
+export function runWithRefreshToken<T>(
+  refreshToken: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return refreshTokenStorage.run(refreshToken, fn);
+}
+
 async function exchangeCodeForToken(
   code: string,
   config: SpotifyConfig,
@@ -161,6 +269,7 @@ export async function authorizeSpotify(): Promise<void> {
     'user-modify-playback-state',
     'user-read-playback-state',
     'user-read-currently-playing',
+    'user-top-read',
   ];
 
   const authParams = new URLSearchParams({
@@ -283,11 +392,16 @@ export async function handleSpotifyRequest<T>(
   action: (spotifyApi: SpotifyApi) => Promise<T>,
 ): Promise<T> {
   try {
-    const spotifyApi = createSpotifyApi();
+    const refreshToken = getRefreshTokenFromContext();
+    console.log(`[${new Date().toISOString()}] Refreshing access token...`);
+    const spotifyApi = await createSpotifyApiForUser(refreshToken);
+    console.log(`[${new Date().toISOString()}] Access token refreshed successfully`);
     return await action(spotifyApi);
   } catch (error) {
-    // Skip JSON parsing errors as these are actually successful operations
     const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`[${new Date().toISOString()}] Error in handleSpotifyRequest:`, errorMessage);
+    
+    // Skip JSON parsing errors as these are actually successful operations
     if (
       errorMessage.includes('Unexpected token') ||
       errorMessage.includes('Unexpected non-whitespace character') ||
@@ -298,4 +412,19 @@ export async function handleSpotifyRequest<T>(
     // Rethrow other errors
     throw error;
   }
+}
+
+/**
+ * Gets a fresh access token for making direct API calls.
+ * Useful for endpoints not directly exposed by the SDK.
+ */
+export async function getAccessToken(): Promise<string> {
+  const refreshToken = getRefreshTokenFromContext();
+  const config = loadSpotifyConfig();
+  const tokenResponse = await refreshAccessToken(
+    refreshToken,
+    config.clientId,
+    config.clientSecret,
+  );
+  return tokenResponse.access_token;
 }
